@@ -8,10 +8,10 @@ uv pip install --python .venv/bin/python -r requirements.txt
 .venv/bin/python tracker.py login
 .venv/bin/python tracker.py telegram-setup
 if .venv/bin/python tracker.py check; then
-  echo 'First scan complete. Hosting is not configured yet. Press Enter to close.'
+  echo 'First scan complete. Open Run.command to start the worker. Press Enter to close.'
 else
   echo 'First scan did not finish successfully. Login and Telegram are saved.'
-  echo 'Use Check.command to retry without logging in again. Press Enter to close.'
+  echo 'Open Run.command to retry without logging in again. Press Enter to close.'
   read
   exit 1
 fi
