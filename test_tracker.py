@@ -58,7 +58,7 @@ class TrackerTests(unittest.TestCase):
         tracker.save_json(tracker.DATA / 'config.json', {'target': 'old', 'telegram_token': 'fake'})
         with self.db:
             tracker.state(self.db, 'target_id', '99')
-        with patch('builtins.input', side_effect=['@new.name', 'n']):
+        with patch('builtins.input', side_effect=['@new.name', 'counts', 'n']):
             tracker.configure()
         self.assertEqual(tracker.config()['target'], 'new.name')
         self.assertFalse(tracker.config()['extra_delay'])
@@ -72,6 +72,68 @@ class TrackerTests(unittest.TestCase):
                 client = tracker.new_client()
                 self.assertEqual(client.request_timeout, 1)
                 self.assertEqual(client.delay_range, [2, 4] if enabled else None)
+
+    def test_counts_mode_skips_lists_and_preserves_name_history(self):
+        client = SimpleNamespace(load_settings=lambda p: None, get_settings=lambda: {},
+            user_info_v1=lambda uid: SimpleNamespace(follower_count=10, following_count=20))
+        with self.db: tracker.state(self.db, 'target_id', '10')
+        with patch.object(tracker, 'new_client', return_value=client), patch.object(tracker, 'collect') as collect:
+            for _ in range(2):
+                self.assertEqual(tracker.check(self.db, {'target': 'test', 'mode': 'counts'}), 'Counts saved.')
+            collect.assert_not_called()
+        self.assertEqual(self.db.execute('SELECT count(*) FROM snapshots').fetchone()[0], 0)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM count_snapshots').fetchone()[0], 2)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM outbox').fetchone()[0], 1)
+        self.assertEqual(json.loads((tracker.DATA / 'counts.json').read_text())['followers'], 10)
+
+    def test_progress_terminal_and_redirected(self):
+        import io
+        output = io.StringIO()
+        with patch.object(tracker.sys, 'stdout', output), patch.object(output, 'isatty', return_value=True):
+            tracker.progress('followers', 3, 4, 2)
+        self.assertIn('3/4 (75%)', output.getvalue())
+        self.assertIn('pass 2/5', output.getvalue())
+        output = io.StringIO()
+        with patch.object(tracker.sys, 'stdout', output): tracker.progress('followers', 0, 0, 1)
+        self.assertEqual(output.getvalue(), '')
+
+    def test_telegram_commands_accept_only_paired_private_chat(self):
+        updates = [
+            {'update_id': 1, 'message': {'chat': {'id': 99, 'type': 'private'}, 'text': '/status'}},
+            {'update_id': 2, 'message': {'chat': {'id': 7, 'type': 'group'}, 'text': '/help'}},
+            {'update_id': 3, 'message': {'chat': {'id': 7, 'type': 'private'}, 'text': '/help'}},
+            {'update_id': 4, 'message': {'chat': {'id': 7, 'type': 'private'}, 'text': '/status@testbot'}},
+        ]
+        tracker.save_json(tracker.DATA / 'config.json', {'target': 'test'})
+        with patch.object(tracker, 'telegram', side_effect=[updates, {}, {}]) as api:
+            tracker.poll_commands(self.db, {'telegram_token': 'fake', 'telegram_chat_id': 7, 'target': 'test'})
+        self.assertEqual(api.call_count, 3)
+        self.assertIn('/status', api.call_args_list[1].args[2]['text'])
+        self.assertIn('Target: @test', api.call_args_list[2].args[2]['text'])
+        self.assertEqual(tracker.state(self.db, 'telegram_update_offset'), '5')
+
+    def test_telegram_reply_failure_does_not_acknowledge_command(self):
+        update = {'update_id': 9, 'message': {'chat': {'id': 7, 'type': 'private'}, 'text': '/help'}}
+        with patch.object(tracker, 'telegram', side_effect=[[update], RuntimeError('offline')]):
+            with self.assertRaises(RuntimeError):
+                tracker.poll_commands(self.db, {'telegram_token': 'fake', 'telegram_chat_id': 7})
+        self.assertIsNone(tracker.state(self.db, 'telegram_update_offset'))
+
+    def test_bot_settings_and_check_request(self):
+        cfg = {'target': 'old', 'telegram_token': 'fake'}
+        with self.db: tracker.state(self.db, 'target_id', '99')
+        self.assertIn('Saved', tracker.bot_command(self.db, cfg, '/target @new.name'))
+        self.assertIsNone(tracker.state(self.db, 'target_id'))
+        tracker.bot_command(self.db, cfg, '/mode counts')
+        tracker.bot_command(self.db, cfg, '/delay off')
+        self.assertEqual(tracker.config()['mode'], 'counts')
+        self.assertFalse(tracker.config()['extra_delay'])
+        self.assertIn('Usage', tracker.bot_command(self.db, cfg, '/interval 0'))
+        tracker.bot_command(self.db, cfg, '/pause')
+        self.assertIn('paused', tracker.bot_command(self.db, cfg, '/check'))
+        tracker.bot_command(self.db, cfg, '/resume')
+        tracker.bot_command(self.db, cfg, '/check')
+        self.assertEqual(tracker.state(self.db, 'requested_check'), '1')
 
     def test_equal_count_replacement_and_rename(self):
         old = {'followers': {'1': 'a', '2': 'b'}, 'following': {}}

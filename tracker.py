@@ -32,7 +32,7 @@ def save_json(path, value):
 
 def config():
     p = DATA / 'config.json'
-    return {'interval_hours': 24, 'extra_delay': True, **(json.loads(p.read_text()) if p.exists() else {})}
+    return {'interval_hours': 24, 'extra_delay': True, 'mode': 'names', **(json.loads(p.read_text()) if p.exists() else {})}
 
 
 def configure():
@@ -42,13 +42,16 @@ def configure():
     if not re.fullmatch(r'[A-Za-z0-9_.]{1,30}', target):
         raise ValueError('Enter an Instagram username, not a URL.')
     target = target.lower()
+    mode = input(f'Tracking mode: counts or names [{cfg["mode"]}]: ').strip().lower() or cfg['mode']
+    if mode not in ('counts', 'names'):
+        raise ValueError('Choose counts or names.')
     answer = input('Extra 2–4 second request delay? [Y/n]: ').strip().lower()
     if answer not in ('', 'y', 'yes', 'n', 'no'):
         raise ValueError('Enter y or n.')
     if target != current:
         with database() as db:
             db.execute("DELETE FROM state WHERE key IN ('target_id', 'last_attempt', 'last_success', 'last_error')")
-    cfg.update(target=target, extra_delay=answer not in ('n', 'no'))
+    cfg.update(target=target, mode=mode, extra_delay=answer not in ('n', 'no'))
     save_json(DATA / 'config.json', cfg)
     print(f'Saved target @{target}; extra delay {"on" if cfg["extra_delay"] else "off"}.')
 
@@ -59,6 +62,8 @@ def database():
     db.executescript('''
     CREATE TABLE IF NOT EXISTS snapshots (
       id INTEGER PRIMARY KEY, target_id TEXT NOT NULL, at TEXT NOT NULL, data TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS count_snapshots (
+      id INTEGER PRIMARY KEY, target_id TEXT NOT NULL, at TEXT NOT NULL, followers INTEGER NOT NULL, following INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS outbox (
       id INTEGER PRIMARY KEY, body TEXT NOT NULL, sent_at TEXT);
     CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -153,8 +158,104 @@ def flush(db, cfg):
             db.execute('UPDATE outbox SET sent_at=? WHERE id=?', (now(), row_id))
 
 
+BOT_COMMANDS = {
+    'help': 'Show commands', 'status': 'Host and tracking status',
+    'target': 'Switch target: /target username', 'mode': 'Choose /mode counts or names',
+    'delay': 'Extra delay: /delay on or off', 'interval': 'Check interval: /interval hours',
+    'check': 'Request a check now', 'pause': 'Pause tracking', 'resume': 'Resume tracking',
+}
+
+
+def register_menu(cfg):
+    if cfg.get('telegram_token') and cfg.get('telegram_chat_id'):
+        telegram(cfg['telegram_token'], 'setMyCommands', {
+            'scope': {'type': 'chat', 'chat_id': cfg['telegram_chat_id']},
+            'commands': [{'command': key, 'description': value} for key, value in BOT_COMMANDS.items()]})
+        telegram(cfg['telegram_token'], 'setChatMenuButton', {
+            'chat_id': cfg['telegram_chat_id'], 'menu_button': {'type': 'commands'}})
+
+
+def bot_command(db, cfg, text):
+    parts = text.split()
+    if not parts:
+        return None
+    command = parts[0].split('@')[0].lower()
+    value = parts[1].lower() if len(parts) == 2 else ''
+    if command == '/help':
+        return '\n'.join(f'/{key} — {description}' for key, description in BOT_COMMANDS.items()) + '\nOne target at a time. Commands wait while a scan runs.'
+    if command == '/status':
+        return (f'Host: active (reply generated {now()})\n'
+                f'Target: @{cfg.get("target", "not configured")}\n'
+                f'Mode: {cfg.get("mode", "names")}\n'
+                f'Tracking: {"paused" if state(db, "paused") else "enabled"}\n'
+                f'Last successful check: {state(db, "last_success") or "none"}\n'
+                f'Interval: {cfg.get("interval_hours", 24)} hours\n'
+                f'Extra delay: {"on" if cfg.get("extra_delay", True) else "off"}')
+    if command == '/target':
+        value = value.lstrip('@')
+        if not re.fullmatch(r'[a-z0-9_.]{1,30}', value):
+            return 'Usage: /target username'
+        if value != cfg.get('target'):
+            with db:
+                db.execute("DELETE FROM state WHERE key IN ('target_id','last_attempt','last_success','last_error')")
+        cfg['target'] = value
+    elif command == '/mode':
+        if value not in ('counts', 'names'): return 'Usage: /mode counts or /mode names'
+        cfg['mode'] = value
+    elif command == '/delay':
+        if value not in ('on', 'off'): return 'Usage: /delay on or /delay off'
+        cfg['extra_delay'] = value == 'on'
+    elif command == '/interval':
+        if not value.isdigit() or not 1 <= int(value) <= 168: return 'Usage: /interval hours (1–168)'
+        cfg['interval_hours'] = int(value)
+    elif command == '/pause':
+        with db: state(db, 'paused', 'user')
+        return 'Tracking paused. Telegram commands remain available.'
+    elif command == '/resume':
+        with db: db.execute("DELETE FROM state WHERE key IN ('paused','last_attempt')")
+        return 'Tracking resumed. A check is due now.'
+    elif command == '/check':
+        if state(db, 'paused'): return 'Tracking is paused. Resolve any Instagram verification, then /resume.'
+        with db: state(db, 'requested_check', '1')
+        return 'Check queued. I will send the result when it finishes.'
+    else:
+        return 'Use /help to see commands.' if command.startswith('/') else None
+    save_json(DATA / 'config.json', cfg)
+    return f'Saved: {command[1:]} {value}.'
+
+
+def poll_commands(db, cfg):
+    token, chat_id = cfg.get('telegram_token'), cfg.get('telegram_chat_id')
+    if not token or not chat_id:
+        return
+    offset = int(state(db, 'telegram_update_offset') or 0)
+    updates = telegram(token, 'getUpdates', {'offset': offset, 'timeout': 0,
+                                          'allowed_updates': ['message']})
+    for update in updates:
+        message = update.get('message', {})
+        chat = message.get('chat', {})
+        text = message.get('text', '').strip()
+        command = text.split()[0].split('@')[0].lower() if text else ''
+        if chat.get('type') == 'private' and str(chat.get('id')) == str(chat_id):
+            cfg = config()
+            reply = bot_command(db, cfg, text)
+            if reply:
+                telegram(token, 'sendMessage', {'chat_id': chat_id, 'text': reply})
+        with db:
+            state(db, 'telegram_update_offset', str(update['update_id'] + 1))
+
+
 class IncompleteRead(Exception):
     pass
+
+
+def progress(kind, current, expected, attempt):
+    if not sys.stdout.isatty():
+        return
+    fraction = min(current / expected, 1) if expected else 1
+    filled = int(fraction * 20)
+    bar = '█' * filled + '░' * (20 - filled)
+    print(f'\r{kind.title()} [{bar}] {current}/{expected} ({fraction:.0%}) · pass {attempt}/5'.ljust(90), end='', flush=True)
 
 
 def collect(client, uid):
@@ -173,9 +274,15 @@ def collect(client, uid):
             previous = len(data[kind])
             rows_read = 0
             rows = getattr(client, f'iter_user_{kind}_v1')(uid, amount=0, page_size=100)
-            for u in rows:
-                rows_read += 1
-                data[kind][str(u.pk)] = u.username
+            progress(kind, len(data[kind]), expected, attempt)
+            try:
+                for u in rows:
+                    rows_read += 1
+                    data[kind][str(u.pk)] = u.username
+                    progress(kind, len(data[kind]), expected, attempt)
+            finally:
+                if sys.stdout.isatty():
+                    print(flush=True)
             last_response = getattr(client, 'last_json', {}) or {}
             gained = len(data[kind]) - previous
             passes.append({'pass': attempt, 'rows': rows_read, 'new': gained,
@@ -229,6 +336,25 @@ def collect(client, uid):
     return data
 
 
+def check_counts(client, db, uid, target):
+    print('Reading follower/following counts…', flush=True)
+    profile = client.user_info_v1(uid)
+    counts = (profile.follower_count, profile.following_count)
+    previous = db.execute('SELECT followers,following FROM count_snapshots WHERE target_id=? ORDER BY id DESC LIMIT 1', (uid,)).fetchone()
+    stamp = now()
+    with db:
+        db.execute('INSERT INTO count_snapshots(target_id,at,followers,following) VALUES (?,?,?,?)', (uid, stamp, *counts))
+        if previous != counts:
+            lines = [f'@{target} · {stamp}', 'Count baseline saved.' if previous is None else 'Profile counts changed.']
+            for i, kind in enumerate(('Followers', 'Following')):
+                change = '' if previous is None else f' ({counts[i] - previous[i]:+d})'
+                lines.append(f'{kind}: {counts[i]}{change}')
+            db.execute('INSERT INTO outbox(body) VALUES (?)', ('\n'.join(lines),))
+    save_json(DATA / 'counts.json', {'target_id': str(uid), 'at': stamp, 'mode': 'counts',
+                                   'followers': counts[0], 'following': counts[1]})
+    print(f'Followers: {counts[0]} · Following: {counts[1]}', flush=True)
+
+
 def new_client():
     from instagrapi import Client
     # Suppress third-party response logs, which can contain account/session data.
@@ -251,13 +377,17 @@ def check(db, cfg):
             uid = str(client.user_info_by_username_v1(cfg['target']).pk)
             with db:
                 state(db, 'target_id', uid)
-        data = collect(client, uid)
-        record(db, uid, cfg['target'], data)
+        mode = cfg.get('mode', 'names')
+        if mode == 'counts':
+            check_counts(client, db, uid, cfg['target'])
+        else:
+            data = collect(client, uid)
+            record(db, uid, cfg['target'], data)
         with db:
             state(db, 'last_success', now())
             db.execute('DELETE FROM state WHERE key="last_error"')
         save_json(DATA / 'session.json', client.get_settings())
-        return 'Complete snapshot saved.'
+        return 'Counts saved.' if mode == 'counts' else 'Complete snapshot saved.'
     except IncompleteRead as exc:
         with db:
             state(db, 'last_error', str(exc))
@@ -314,7 +444,7 @@ def setup_telegram():
 
 def status():
     with database() as db:
-        return {'target': config().get('target'), 'state': dict(db.execute('SELECT key,value FROM state')),
+        return {'target': config().get('target'), 'mode': config()['mode'], 'state': dict(db.execute('SELECT key,value FROM state')),
                 'snapshots': db.execute('SELECT count(*) FROM snapshots').fetchone()[0],
                 'pending_alerts': db.execute('SELECT count(*) FROM outbox WHERE sent_at IS NULL').fetchone()[0]}
 
@@ -322,10 +452,13 @@ def status():
 def main():
     os.umask(0o077)
     DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='Track Instagram profile counts or follower/following username changes.',
+        epilog='Setup: configure → login → telegram-setup → check. Use run for daily checks. Telegram setup pairs a BotFather bot with your private chat.')
     parser.add_argument('command', choices=['configure', 'login', 'telegram-setup', 'check', 'run', 'status', 'resume'])
     parser.add_argument('--extra-delay', action=argparse.BooleanOptionalAction, default=None,
                         help='Save whether to add 2–4 seconds per request (one-second base pause remains).')
+    parser.add_argument('--mode', choices=['counts', 'names'],
+                        help='Save tracking mode: counts reads totals only; names scans lists and reports account changes.')
     args = parser.parse_args()
     if args.command == 'status':
         print(json.dumps(status(), indent=2)); return
@@ -334,6 +467,10 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError('Another tracker process is running. Stop it before setup/check.') from None
+        if args.mode is not None:
+            cfg = config()
+            cfg['mode'] = args.mode
+            save_json(DATA / 'config.json', cfg)
         if args.extra_delay is not None:
             cfg = config()
             cfg['extra_delay'] = args.extra_delay
@@ -353,14 +490,31 @@ def main():
                 with db:
                     db.execute('DELETE FROM state WHERE key="paused"')
                 print('Resumed.'); return
+            if args.command == 'run':
+                try:
+                    register_menu(config())
+                except RuntimeError as exc:
+                    print(str(exc), flush=True)
             while True:
+                cfg = config()
+                if args.command == 'run':
+                    try:
+                        poll_commands(db, cfg)
+                    except RuntimeError as exc:
+                        print(str(exc), flush=True)
                 cfg = config()
                 last = state(db, 'last_attempt')
                 due = not last or time.time() - float(last) >= max(1, cfg['interval_hours']) * 3600
-                if args.command == 'check' or due:
+                requested = state(db, 'requested_check') == '1'
+                if args.command == 'check' or ((due or requested) and not state(db, 'paused')):
                     with db:
                         state(db, 'last_attempt', str(time.time()))
-                    print(check(db, cfg), flush=True)
+                        db.execute("DELETE FROM state WHERE key='requested_check'")
+                    result = check(db, cfg)
+                    print(result, flush=True)
+                    if requested:
+                        with db:
+                            db.execute('INSERT INTO outbox(body) VALUES (?)', (result,))
                 try:
                     flush(db, cfg)
                 except RuntimeError as exc:
@@ -369,7 +523,7 @@ def main():
                         return 3
                 if args.command == 'check':
                     return 2 if state(db, 'last_error') or state(db, 'paused') else 0
-                time.sleep(60)
+                time.sleep(10)
 
 
 if __name__ == '__main__':

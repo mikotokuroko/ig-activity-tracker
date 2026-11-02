@@ -4,13 +4,21 @@ Tracks follower and following lists through `instagrapi`, an unofficial Instagra
 
 ## Setup
 
-On macOS, install [uv](https://docs.astral.sh/uv/), then double-click `Setup.command`. It prompts for the target username, request-delay preference, Instagram login and Telegram bot pairing. Create your bot with Telegram’s `@BotFather` first.
+On macOS, install [uv](https://docs.astral.sh/uv/), then double-click `Setup.command`. It prompts for the target username, tracking mode, request-delay preference, Instagram login and Telegram bot pairing. Create your bot with Telegram’s `@BotFather` first.
+
+Double-click `Run.command` to run the local worker and register the Telegram command menu. Keep the Mac awake and the Terminal window open. It tracks one selected account at a time; switch it with `/target`. `/status` replies only while the host is running.
 
 After setup, run `Check.command` for a single check. Login and Telegram pairing are saved; no need to repeat setup.
 
 ```sh
-# Change target and delay preference
+# Change target, tracking mode and delay preference
 .venv/bin/python tracker.py configure
+
+# Counts only (fast; no username lists)
+.venv/bin/python tracker.py check --mode counts
+
+# Full lists and username changes, with a terminal progress bar
+.venv/bin/python tracker.py check --mode names
 
 # Check with only the one-second base pause; saves this preference
 .venv/bin/python tracker.py check --no-extra-delay
@@ -22,15 +30,19 @@ After setup, run `Check.command` for a single check. Login and Telegram pairing 
 .venv/bin/python tracker.py run
 ```
 
+Mode and delay choices are saved for subsequent checks. Use `tracker.py --help` for CLI options.
+
 ## Included
 
 - Up to five passes per incomplete list, merged by account ID; stops after two passes recover nothing new.
 - Incomplete scans preserve the baseline. Removal alerts require absence in two complete checks.
-- `data/followers-following.json`: latest lists, counts, pass statistics and completeness.
+- Names mode: `data/followers-following.json` stores lists, counts, pass statistics and completeness.
+- Counts mode: `data/counts.json` stores totals; Telegram reports count changes. Count history is separate from username history.
 - `Diagnose.command`: compares follower endpoints and saves page diagnostics.
 - `Login.command`, `Telegram.command`: repeat login or bot pairing separately.
-- `Export.command`: runs a check and exports JSON.
+- `Export.command`: runs a check and exports JSON for the saved mode.
 - `mcp_server.py`: read-only `tracker_status` and `recent_snapshots` tools over stdio.
+- Telegram command menu: `/help`, `/status`, `/target username`, `/mode counts|names`, `/delay on|off`, `/interval hours`, `/check`, `/pause`, `/resume`, restricted to the paired private chat. The worker polls every ten seconds between scans; commands wait while a scan is running.
 - Docker Compose worker with persistent `./data` and restart policy.
 
 For hosting, securely copy the project and local `data/` directory to your server, stop any local worker, then run `docker compose up -d --build`.
